@@ -30,6 +30,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
+    - name: Set lowercase image name
+      run: |
+        echo "IMAGE_NAME_LOWER=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
     # Install the cosign tool except on PR
     # https://github.com/sigstore/cosign-installer
     - name: Install cosign
@@ -60,7 +64,7 @@ jobs:
       id: meta
       uses: docker/metadata-action@v5
       with:
-        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}
         tags: |
           type=ref,event=branch
           type=ref,event=pr
@@ -113,7 +117,7 @@ jobs:
     - name: Run security scan with Trivy
       uses: aquasecurity/trivy-action@master
       with:
-        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LOWER }}:${{ github.sha }}
         format: 'sarif'
         output: 'trivy-results.sarif'
 
