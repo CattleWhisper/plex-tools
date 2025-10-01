@@ -1,0 +1,5 @@
+PlexAPI==4.15.13
+python-dotenv==1.0.1
+requests==2.31.0
+tqdm==4.66.2
+google-api-python-client==2.108.0

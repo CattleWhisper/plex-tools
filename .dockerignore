@@ -1,0 +1,20 @@
+# Docker ignore file for plex-info-hydrator
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/
+.venv/
+venv/
+ENV/
+env/
+.DS_Store
+.git/
+.gitignore
+*.log
+.env
+youtube_metadata_cache.json
+yt_info/
