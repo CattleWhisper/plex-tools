@@ -5,11 +5,6 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user
-RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
-
-USER app
-
 # Set working directory
 WORKDIR /app
 
