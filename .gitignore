@@ -29,4 +29,6 @@ Thumbs.db
 *.temp
 
 # Cache files
+*cookies.txt
 youtube_metadata_cache.json
+youtube_synced_videos.json
