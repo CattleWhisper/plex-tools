@@ -1,6 +1,6 @@
 PlexAPI==4.15.13
 python-dotenv==1.0.1
-requests==2.31.0
+requests==2.33.0
 tqdm==4.66.3
 google-api-python-client==2.108.0
 yt-dlp>=2023.12.30
