@@ -23,6 +23,7 @@ The scripts read configuration from `.env` via `python-dotenv`: `PLEX_URL`, `PLE
 - `sync_watched_to_youtube.py`: finds watched items in Plex and marks them watched on YouTube by shelling out to `yt-dlp --mark-watched` with a cookies file. Synced IDs are tracked in `youtube_synced_videos.json` so they are skipped later.
 - `populate_youtube_cache.py`: builds or merges the metadata cache from yt-dlp `yt_info/*.info.json` files, which avoids spending API quota.
 - `refresh_youtube_cache.py`: re-fetches every cached ID from the YouTube API and overwrites its entry.
+- `cleanup_orphans.py`: filesystem only, no Plex connection. Walks the given directories and removes yt-dlp sidecars (`.info.json`, thumbnails, subtitles) whose `[id]` has no video file in the same directory, which is what's left after Plex deletes a video. It is a dry run unless `--delete` is passed.
 - `list_media.py` / `find_similar_titles.py`: read-only Plex reporting. The second one does fuzzy title grouping to spot duplicates.
 
 ## Shared state
