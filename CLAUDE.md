@@ -19,7 +19,7 @@ The scripts read configuration from `.env` via `python-dotenv`: `PLEX_URL`, `PLE
 
 ## Scripts
 
-- `youtube_hydrator.py`: the main tool and the only one in the Docker image. For every item in a Plex library it extracts the 11-char YouTube ID from the media file path (patterns like `[id]`, `(id)`, `_id.ext`, `-id.ext`), fetches metadata from the YouTube Data API v3, and edits the Plex item. The title becomes `<channel> - <title>`, and it also sets the summary and the originally-available date. The dry-run/live prompt in `main()` is disabled (`while False:`), so it **always runs live** against Plex. It also disables SSL verification for the YouTube client.
+- `youtube_hydrator.py`: the main tool and the default command of the Docker image. For every item in a Plex library it extracts the 11-char YouTube ID from the media file path (patterns like `[id]`, `(id)`, `_id.ext`, `-id.ext`), fetches metadata from the YouTube Data API v3, and edits the Plex item. The title becomes `<channel> - <title>`, and it also sets the summary and the originally-available date. The dry-run/live prompt in `main()` is disabled (`while False:`), so it **always runs live** against Plex. It also disables SSL verification for the YouTube client.
 - `sync_watched_to_youtube.py`: finds watched items in Plex and marks them watched on YouTube by shelling out to `yt-dlp --mark-watched` with a cookies file. Synced IDs are tracked in `youtube_synced_videos.json` so they are skipped later.
 - `populate_youtube_cache.py`: builds or merges the metadata cache from yt-dlp `yt_info/*.info.json` files, which avoids spending API quota.
 - `refresh_youtube_cache.py`: re-fetches every cached ID from the YouTube API and overwrites its entry.
@@ -32,4 +32,4 @@ The scripts read configuration from `.env` via `python-dotenv`: `PLEX_URL`, `PLE
 
 ## CI / Docker
 
-`.github/workflows/docker-build.yml` builds a multi-arch (amd64/arm64) image on pushes and PRs to `master` and on `v*` tags. It pushes the image to `ghcr.io/<repo>` and signs it with cosign, except on PRs. The `Dockerfile` copies only `youtube_hydrator.py`, so other scripts aren't available in the container unless the `COPY` line changes.
+`.github/workflows/docker-build.yml` builds a multi-arch (amd64/arm64) image on pushes and PRs to `master` and on `v*` tags. It pushes the image to `ghcr.io/<repo>` and signs it with cosign, except on PRs. The `Dockerfile` copies only `youtube_hydrator.py` (the default command) and `cleanup_orphans.py`, so other scripts aren't available in the container unless the `COPY` line changes.

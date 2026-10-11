@@ -16,6 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY youtube_hydrator.py .
+COPY cleanup_orphans.py .
 #COPY *.py .
 #COPY *.md .
 
