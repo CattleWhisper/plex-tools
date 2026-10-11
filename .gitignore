@@ -1,3 +1,6 @@
+# Sandbox
+sandbox/
+
 # Plex Info Hydrator - Project Files
 __pycache__/
 *.py[cod]
@@ -32,3 +35,4 @@ Thumbs.db
 *cookies.txt
 youtube_metadata_cache.json
 youtube_synced_videos.json
+yt_info/*.info.json
