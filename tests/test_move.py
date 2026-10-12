@@ -191,3 +191,20 @@ def test_catalog_reads_archive_by_name_inside_inbox(env, monkeypatch):
     assert mo.catalog_from_disk(config) == 0
     catalog = json.loads((env['inbox'].parent / 'state' / 'catalog.json').read_text())
     assert [e['ytid'] for e in catalog] == ['SWORDPART01']
+
+
+@pytest.mark.parametrize('content', ['', '{"truncated": '])
+def test_unreadable_metadata_cache_is_moved_aside(tmp_path, content):
+    cache = tmp_path / 'youtube_metadata_cache.json'
+    cache.write_text(content)
+    assert mo.load_metadata_cache(str(cache)) == {}
+    assert not cache.exists()
+    assert [p.read_text() for p in tmp_path.glob('youtube_metadata_cache.json.corrupt-*')] == [content]
+    assert mo.load_metadata_cache(str(tmp_path / 'missing.json')) == {}
+
+
+def test_catalog_runs_with_empty_cache_file(env):
+    state = env['inbox'].parent / 'state'
+    state.mkdir()
+    (state / 'youtube_metadata_cache.json').write_text('')
+    assert mo.catalog_from_disk(dict(env['config'], youtube_api_key=None)) == 0

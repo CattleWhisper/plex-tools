@@ -930,6 +930,20 @@ def info_json_metadata(video: str) -> Optional[Dict[str, str]]:
     }
 
 
+def load_metadata_cache(path: str) -> Dict[str, Dict[str, str]]:
+    """
+    YouTube metadata cache; an unreadable file (empty, truncated copy) is moved aside as
+    '<name>.corrupt-<timestamp>' so the run continues with an empty cache instead of failing.
+    """
+    try:
+        return load_json(path, {})
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        broken = f"{path}.corrupt-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        os.replace(path, broken)
+        logging.warning(f"Metadata cache {path} is not valid JSON ({e}); moved to {broken}, starting empty")
+        return {}
+
+
 def make_youtube_metadata_fetcher(api_key: Optional[str], cache: Dict[str, Dict[str, str]]):
     """Same lookup as youtube_hydrator.py: cache first, then the YouTube Data API (results are cached)."""
     service_holder = {}
@@ -1990,7 +2004,7 @@ def catalog_from_disk(config: dict) -> int:
         print(f"❌ Error: inbox_dir {inbox_dir} does not exist")
         return 1
     cache_path = os.path.expanduser(config.get('metadata_cache') or os.path.join(state_dir, 'youtube_metadata_cache.json'))
-    cache = load_json(cache_path, {})
+    cache = load_metadata_cache(cache_path)
     cached_before = len(cache)
     fetch = make_youtube_metadata_fetcher(config.get('youtube_api_key'), cache)
 
