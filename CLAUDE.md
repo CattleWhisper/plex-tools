@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-A collection of standalone Python scripts for managing a Plex library of downloaded YouTube videos. There is no package, shared module, test suite, or linter: each script at the repo root is self-contained and run directly. Helpers like `setup_logging`, `connect_to_plex`, `get_library`, `extract_youtube_id` and the cache load/save functions are **copy-pasted across scripts**. When changing one, check whether the same function in the other scripts needs the same change.
+A collection of standalone Python scripts for managing a Plex library of downloaded YouTube videos. There is no package or linter: each script at the repo root is self-contained and run directly. Only `manhwa_organizer.py` has tests (see below). Helpers like `setup_logging`, `connect_to_plex`, `get_library`, `extract_youtube_id` and the cache load/save functions are **copy-pasted across scripts**. When changing one, check whether the same function in the other scripts needs the same change.
 
 ## Running
 
@@ -26,10 +26,34 @@ The scripts read configuration from `.env` via `python-dotenv`: `PLEX_URL`, `PLE
 - `cleanup_orphans.py`: filesystem only, no Plex connection. Walks the given directories and removes yt-dlp sidecars (`.info.json`, thumbnails, subtitles) whose `[id]` has no video file in the same directory, which is what's left after Plex deletes a video. It is a dry run unless `--delete` is passed.
 - `list_media.py` / `find_similar_titles.py`: read-only Plex reporting. The second one does fuzzy title grouping to spot duplicates.
 
+## manhwa_organizer.py
+
+Reorganizes the "Manhwa" library (Plex type Other Videos, one flat folder, files named `%(channel)s - %(title)s [%(id)s].ext` by yt-dlp) into the "Manhwa Series" TV library: one show per story, one episode per part. The tests (`tests/`) are the reference for the intended behavior.
+
+Pipeline (CLI subcommands): `catalog` → `plan` → `apply` → `refresh`, with `export-watch`, `collections`, `sync-watch`, and `sync` for incremental runs. `sync` runs catalog, plan, watch export, apply, then refresh for new and moved videos only. It then carries watch progress made in the old library into already-migrated videos (`forward_watch_changes`). That step is forward only: it never unmarks a played video or rewinds progress. Plex's API cannot set watched dates, so restored views get the current date. Every command that writes has `--dry-run`, and `apply_plan`/`refresh_library` default to dry run.
+
+```bash
+.venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
+.venv/bin/python -m pytest -q                          # all tests
+.venv/bin/python -m pytest -q tests/test_plan.py -k title
+.venv/bin/python manhwa_organizer.py plan              # rebuild state/plan.csv from state/catalog.json
+.venv/bin/python manhwa_organizer.py sync --dry-run
+```
+
+How it decides things:
+- **Grouping** (`group_videos`): union-find over videos linked by labelled YouTube links in descriptions (`Part N <url>`; unlabelled links are ignored on purpose), plus same channel + same normalized title (`title_key`). Overrides in `overrides.yaml` (`show_names`, `parts`, `merge`, `detach`) are applied on top.
+- **Part number** (`collect_votes`/`decide_part`): weighted votes. Explicit self-claim and timestamp chapters weigh 3, citations by other videos 2, title formats (`Part N`, `(N)`, `[N]`, `[N-M]`, `#N+M`, `Manhwa Recap N`) 1.5, gap inference 1. Description evidence deliberately outranks titles.
+- **Episodes** (`assign_episodes`): a compilation covering parts that no individual video has takes those parts. If none exist, it becomes a multi-episode file (`S01E01-E05`); if all exist, it goes to Season 00. Timestamp chapters only count when other videos of the series are numbered (many standalone videos have internal "Parte 1/2" sections). An old unnumbered video before all numbered ones becomes part 1.
+- **Stability**: `state/applied.json` pins show names and current paths. Without it, `load_applied` rebuilds it from the target tree, so a fresh state volume does not reapply everything.
+
+Files and safety: `apply` only creates hardlinks (`link_mode`) and jpgs under `target_root`, and only deletes inside it. Originals are never touched. Hardlinks need the same filesystem. macOS writes `._*` AppleDouble files on the NFS share, and `is_os_junk` ignores them. `refresh` locks episode title ("Parte N"), summary and date, plus show title and Studio (= channel). The `collections` command creates one smart collection per channel, filtering on Studio.
+
+Config is in `config.yaml` (gitignored; `config.example.yaml` documents it). Plex URL, token and source library fall back to `.env`. Runtime state lives in `state/` (gitignored), and watch-state backups go to `state/backups/`. In production `sync` runs as a Kubernetes CronJob from the Docker image, as uid 1000 with the NFS share mounted at `/data` (the same path Plex sees, so `path_map` is empty) and `state_dir` on a PVC. The manifest lives outside this repo.
+
 ## Shared state
 
 `youtube_metadata_cache.json` sits next to the scripts and is keyed by video ID, with `title`, `channel_name`, `description` and `published_at`. The hydrator, populate and refresh scripts all read and write this same format. The hydrator checks the cache before calling the API (quota is the main constraint). The populate and refresh scripts write a `.backup` copy before saving. Cache files, `yt_info/*.info.json`, `*cookies.txt`, `.env` and `sandbox/` are gitignored and contain user data.
 
 ## CI / Docker
 
-`.github/workflows/docker-build.yml` builds a multi-arch (amd64/arm64) image on pushes and PRs to `master` and on `v*` tags. It pushes the image to `ghcr.io/<repo>` and signs it with cosign, except on PRs. The `Dockerfile` copies only `youtube_hydrator.py` (the default command) and `cleanup_orphans.py`, so other scripts aren't available in the container unless the `COPY` line changes.
+`.github/workflows/docker-build.yml` builds a multi-arch (amd64/arm64) image on pushes and PRs to `master` and on `v*` tags. It pushes the image to `ghcr.io/<repo>` and signs it with cosign, except on PRs. The `Dockerfile` copies only `youtube_hydrator.py` (the default command), `cleanup_orphans.py` and `manhwa_organizer.py` (which needs the `fonts-dejavu-core` package for posters), so other scripts aren't available in the container unless the `COPY` lines change.
