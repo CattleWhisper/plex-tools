@@ -1,8 +1,9 @@
 # Use Python 3.11 slim image as base
 FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies (DejaVu font for manhwa_organizer posters)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
@@ -17,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY youtube_hydrator.py .
 COPY cleanup_orphans.py .
+COPY manhwa_organizer.py .
 #COPY *.py .
 #COPY *.md .
 
