@@ -36,3 +36,9 @@ Thumbs.db
 youtube_metadata_cache.json
 youtube_synced_videos.json
 yt_info/*.info.json
+
+# Manhwa organizer
+state/
+config.yaml
+overrides.yaml
+.pytest_cache/

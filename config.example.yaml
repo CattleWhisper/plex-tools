@@ -1,0 +1,14 @@
+plex:                                   # empty -> PLEX_URL / PLEX_TOKEN from .env
+  url:
+  token:
+source_library:                         # empty -> LIBRARY_NAME from .env
+target_library: "Manhwa Series"         # new library (type TV Shows)
+target_root: ~/mnt/plex-media/Manhwa-Series   # LOCAL path where the script builds the tree
+path_map:                               # Plex prefix -> local prefix
+  "/data": "~/mnt/plex-media"
+info_json_dir:                        # empty -> .info.json next to each video (via path_map)
+link_mode: hardlink                     # hardlink | symlink | copy
+users: []                               # all | [] (owner only) | [name1, name2]
+strip_title_patterns: []
+state_dir: ./state
+scan_timeout_minutes: 30
