@@ -155,7 +155,10 @@ def test_validate_rejects_target_inside_source(env):
     config = dict(env['config'], target_root=str(env['source_dir'] / 'Series'))
     assert mo.validate_apply_config(config, {str(env['source_dir'])})
     assert mo.validate_apply_config(env['config'], {str(env['source_dir'])}) == []
-    assert mo.validate_apply_config(dict(env['config'], link_mode='move'), set())
+    assert mo.validate_apply_config(dict(env['config'], link_mode='teleport'), set())
+    assert mo.validate_apply_config(dict(env['config'], link_mode='move'), set()) == ["link_mode 'move' needs inbox_dir"]
+    inside = dict(env['config'], link_mode='move', inbox_dir=str(env['target_root'] / 'inbox'))
+    assert 'overlaps' in mo.validate_apply_config(inside, set())[0]
 
 
 def test_poster_wraps_long_names():

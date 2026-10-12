@@ -17,6 +17,7 @@ import sys
 import unicodedata
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional, Set, Tuple
 
 import yaml
@@ -81,6 +82,10 @@ DEFAULT_CONFIG = {
     'target_root': None,
     'path_map': {},
     'info_json_dir': None,
+    'inbox_dir': None,
+    'download_archive': None,
+    'metadata_cache': None,
+    'youtube_api_key': None,
     'link_mode': 'hardlink',
     'users': 'all',
     'strip_title_patterns': [],
@@ -116,7 +121,9 @@ def load_config(path: Optional[str]) -> dict:
     plex['url'] = plex['url'] or os.getenv('PLEX_URL')
     plex['token'] = plex['token'] or os.getenv('PLEX_TOKEN')
     config['plex'] = plex
-    config['source_library'] = config['source_library'] or os.getenv('LIBRARY_NAME')
+    config['youtube_api_key'] = config['youtube_api_key'] or os.getenv('YOUTUBE_API_KEY')
+    if not config.get('inbox_dir'):
+        config['source_library'] = config['source_library'] or os.getenv('LIBRARY_NAME')
     return config
 
 
@@ -583,7 +590,8 @@ def target_relpath(show: str, member: dict) -> str:
 def dedupe_catalog(catalog: List[dict]) -> Tuple[Dict[str, dict], Dict[str, List[dict]]]:
     """
     Index catalog by YouTube ID. When one ID has several files (video re-downloaded after a
-    title change), keep the most recently added one and return the others as ignored.
+    title change), keep the one already in the library, else the most recently added one, and
+    return the others as ignored.
     """
     by_id: Dict[str, List[dict]] = defaultdict(list)
     for entry in catalog:
@@ -592,7 +600,8 @@ def dedupe_catalog(catalog: List[dict]) -> Tuple[Dict[str, dict], Dict[str, List
 
     videos, ignored = {}, {}
     for ytid, entries in by_id.items():
-        entries.sort(key=lambda e: (e.get('addedAt') or '', e.get('ratingKey') or 0), reverse=True)
+        entries.sort(key=lambda e: (e.get('location') == 'library', e.get('addedAt') or '', e.get('ratingKey') or 0),
+                     reverse=True)
         videos[ytid] = entries[0]
         if len(entries) > 1:
             ignored[ytid] = entries[1:]
@@ -853,6 +862,141 @@ def build_catalog(section, config: Optional[dict] = None,
     return entries, skipped
 
 
+# --------------------------------------------------------------------------- #
+# Disk catalog: inbox folder + organized library, metadata from YouTube
+# --------------------------------------------------------------------------- #
+
+SUBTITLE_EXTENSIONS = ('.srt', '.vtt', '.ass')
+
+
+def list_videos(directory: str, recursive: bool) -> List[str]:
+    """Video files named '... [ytid].ext' (yt-dlp temp files like '.f137.mp4' or '.part' never match)."""
+    if not directory or not os.path.isdir(directory):
+        return []
+    walker = os.walk(directory) if recursive else [(directory, [], os.listdir(directory))]
+    videos = []
+    for dirpath, _, filenames in walker:
+        for filename in filenames:
+            if is_os_junk(filename) or os.path.splitext(filename)[1].lower() not in VIDEO_EXTENSIONS:
+                continue
+            if FILE_YTID_RE.search(filename):
+                videos.append(os.path.join(dirpath, filename))
+    return sorted(videos)
+
+
+_listdir_cache: Dict[str, List[str]] = {}
+
+
+def clear_listdir_cache() -> None:
+    _listdir_cache.clear()
+
+
+def cached_listdir(directory: str) -> List[str]:
+    """One listing per folder and run: the inbox holds thousands of files on a slow network share."""
+    if directory not in _listdir_cache:
+        try:
+            _listdir_cache[directory] = os.listdir(directory)
+        except OSError:
+            _listdir_cache[directory] = []
+    return _listdir_cache[directory]
+
+
+def video_sidecars(video: str) -> List[str]:
+    """Files next to the video sharing its name: 'X [id].info.json', 'X [id].pt.srt', 'X [id].webp'..."""
+    base = os.path.splitext(os.path.basename(video))[0]
+    directory = os.path.dirname(video)
+    # Only known companions: yt-dlp leftovers like '.f137.mp4.part', '.f140.m4a' or '.temp.mp4' stay put
+    names = [os.path.join(directory, name) for name in cached_listdir(directory)
+             if name.startswith(base + '.') and name != os.path.basename(video) and not is_os_junk(name)
+             and name.lower().endswith(MANAGED_SIDECAR_SUFFIXES)]
+    return sorted(path for path in names if os.path.exists(path))
+
+
+def info_json_metadata(video: str) -> Optional[Dict[str, str]]:
+    """Fallback metadata from the yt-dlp .info.json next to the video (same keys as the YouTube cache)."""
+    path = os.path.splitext(video)[0] + '.info.json'
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    upload_date = data.get('upload_date') or ''
+    published = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:8]}" if len(upload_date) == 8 else ''
+    return {
+        'title': data.get('title') or '',
+        'channel_name': data.get('channel') or data.get('uploader') or '',
+        'description': data.get('description') or '',
+        'published_at': published,
+    }
+
+
+def make_youtube_metadata_fetcher(api_key: Optional[str], cache: Dict[str, Dict[str, str]]):
+    """Same lookup as youtube_hydrator.py: cache first, then the YouTube Data API (results are cached)."""
+    service_holder = {}
+
+    def fetch(ytid: str) -> Optional[Dict[str, str]]:
+        if ytid in cache:
+            return cache[ytid]
+        if not api_key:
+            return None
+        from youtube_hydrator import get_youtube_metadata
+        if 'service' not in service_holder:
+            from googleapiclient.discovery import build
+            service_holder['service'] = build('youtube', 'v3', developerKey=api_key, cache_discovery=False)
+        return get_youtube_metadata(service_holder['service'], ytid, cache)
+
+    return fetch
+
+
+def disk_catalog_entry(video: str, location: str, fetch_metadata) -> dict:
+    ytid = extract_ytid_from_path(video)
+    metadata, source = fetch_metadata(ytid), 'youtube'
+    if not metadata:
+        metadata, source = info_json_metadata(video), 'info.json'
+    if not metadata:
+        metadata, source = {}, 'filename'
+    base = os.path.splitext(os.path.basename(video))[0]
+    fallback_title = re.sub(r'\s*\[[A-Za-z0-9_-]{11}\]$', '', base)
+    channel = metadata.get('channel_name') or channel_from_path(video)
+    return {
+        'ytid': ytid,
+        'channel': channel,
+        'channel_source': source,
+        'title': metadata.get('title') or fallback_title,
+        'summary': metadata.get('description', ''),
+        'date': (metadata.get('published_at') or '')[:10],
+        'addedAt': datetime.fromtimestamp(os.path.getmtime(video)).isoformat(),
+        'location': location,
+        'thumb': None,
+        'file': video,
+    }
+
+
+def load_download_archive(path: Optional[str]) -> Optional[Set[str]]:
+    """IDs of finished downloads from a yt-dlp --download-archive file ('youtube <id>' per line)."""
+    if not path:
+        return None
+    with open(os.path.expanduser(path), 'r', encoding='utf-8') as f:
+        return {parts[1] for parts in (line.split() for line in f) if len(parts) >= 2}
+
+
+def build_disk_catalog(inbox_dir: Optional[str], target_root: str, fetch_metadata,
+                       archive_ids: Optional[Set[str]] = None) -> Tuple[List[dict], List[str]]:
+    """
+    Catalog every video of the library tree and of the inbox (inbox: top level only).
+    archive_ids: when given, inbox videos whose ID is not in the yt-dlp download archive are still
+    downloading (or failed) and are skipped. Returns (entries, skipped inbox files).
+    """
+    entries = [disk_catalog_entry(video, 'library', fetch_metadata) for video in list_videos(target_root, True)]
+    skipped = []
+    for video in list_videos(inbox_dir, False):
+        if archive_ids is not None and extract_ytid_from_path(video) not in archive_ids:
+            skipped.append(video)
+            continue
+        entries.append(disk_catalog_entry(video, 'inbox', fetch_metadata))
+    return entries, skipped
+
+
 def plex_user_names(plex, users_setting) -> List[str]:
     """Other Plex users whose watch state must be migrated ('all' | [] | [names])."""
     if users_setting == 'all':
@@ -894,7 +1038,8 @@ def export_watch(plex, library: str, users_setting, ids: Optional[Set[str]] = No
 # Apply: target tree (links, thumbs, posters)
 # --------------------------------------------------------------------------- #
 
-LINK_MODES = ('hardlink', 'symlink', 'copy')
+LINK_MODES = ('move', 'hardlink', 'symlink', 'copy')
+MANAGED_SIDECAR_SUFFIXES = ('.jpg', '.jpeg', '.webp', '.png', '.srt', '.vtt', '.ass', '.info.json')
 POSTER_SIZE = (1000, 1500)
 POSTER_MAX_LINES = 5
 POSTER_FONT_CANDIDATES = [
@@ -923,6 +1068,7 @@ class Action:
 @dataclass
 class ApplyResult:
     actions: List[Action] = field(default_factory=list)
+    planned: Set[str] = field(default_factory=set)   # paths that will exist after a real run
     new: List[str] = field(default_factory=list)
     moved: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
@@ -963,11 +1109,19 @@ def nearest_existing_dir(path: str) -> str:
 def validate_apply_config(config: dict, source_dirs: Set[str]) -> List[str]:
     """Return a list of fatal problems with the target configuration."""
     problems = []
-    target_root = config.get('target_root')
+    target_root = os.path.expanduser(config.get('target_root') or '')
     if not target_root:
         return ["target_root is not set in config.yaml"]
     if config.get('link_mode') not in LINK_MODES:
         problems.append(f"link_mode must be one of {LINK_MODES}")
+    if config.get('link_mode') == 'move':
+        # Library videos are their own source here; only the inbox must stay outside the library
+        inbox = config.get('inbox_dir')
+        if not inbox:
+            problems.append("link_mode 'move' needs inbox_dir")
+        elif is_inside(os.path.expanduser(inbox), target_root) or is_inside(target_root, os.path.expanduser(inbox)):
+            problems.append(f"inbox_dir {inbox} overlaps target_root {target_root}")
+        return problems
     for source_dir in source_dirs:
         if is_inside(target_root, source_dir) or is_inside(source_dir, target_root):
             problems.append(f"target_root {target_root} overlaps the source library folder {source_dir}")
@@ -1143,6 +1297,45 @@ def link_is_current(source: str, target: str, mode: str) -> bool:
     return same_file(source, target)
 
 
+def sidecar_destination(sidecar: str, video: str, target: str) -> str:
+    """'X [id].pt.srt' next to video 'X [id].mp4' -> '<target base>.pt.srt'; images become the episode .jpg."""
+    suffix = os.path.basename(sidecar)[len(os.path.splitext(os.path.basename(video))[0]):]
+    if suffix.lower() in SIDECAR_IMAGE_EXTENSIONS:
+        return thumb_path_for(target)
+    return os.path.splitext(target)[0] + suffix
+
+
+def move_file(source: str, destination: str) -> None:
+    """Rename (same filesystem); non-JPEG images are converted to the JPEG destination."""
+    if destination.endswith('.jpg') and os.path.splitext(source)[1].lower() not in ('.jpg', '.jpeg'):
+        with open(source, 'rb') as f:
+            save_jpeg(f.read(), destination)
+        os.remove(source)
+    else:
+        os.rename(source, destination)
+
+
+def move_sidecars(video: str, target: str, result: ApplyResult, dry_run: bool, drop_existing: bool = False) -> None:
+    """
+    Move the files that accompany a video (info.json, subtitles, thumbnail) next to its new name.
+    drop_existing: delete a sidecar whose destination already exists (inbox twin adoption) instead of erroring.
+    """
+    for sidecar in video_sidecars(video):
+        destination = sidecar_destination(sidecar, video, target)
+        if os.path.exists(destination) or destination in result.planned:
+            if drop_existing:
+                result.add('remove', sidecar, 'already in library')
+                if not dry_run:
+                    os.remove(sidecar)
+            else:
+                result.add('error', sidecar, f"not moved, {destination} already exists")
+            continue
+        result.add('move', destination, sidecar)
+        result.planned.add(destination)
+        if not dry_run:
+            move_file(sidecar, destination)
+
+
 def remove_managed_file(path: str, target_root: str, result: ApplyResult, dry_run: bool, detail: str) -> None:
     """Delete a file we created; refuses anything outside target_root."""
     if not os.path.lexists(path):
@@ -1194,26 +1387,34 @@ def plan_members(plan: dict) -> List[Tuple[dict, dict]]:
 def apply_plan(plan: dict, config: dict, applied: Dict[str, dict], fetch_image,
                dry_run: bool = True, force_posters: bool = False) -> ApplyResult:
     """
-    Build/update the target tree from the plan. Original files are only ever read.
+    Build/update the target tree from the plan.
+    link_mode 'move': videos (and their sidecars) are moved from the inbox, or renamed inside the library
+    when their episode changes; inbox copies that are hardlinks of a library file are adopted (deleted
+    once confirmed to be the same inode). Other modes link/copy and never touch the originals.
     applied: previous state {ytid: {'show', 'target', ...}}; returns the new one in result.applied.
     """
     result = ApplyResult()
+    clear_listdir_cache()
     path_map = config.get('path_map') or {}
     mode = config.get('link_mode', 'hardlink')
+    moving = mode == 'move'
     target_root = os.path.expanduser(config['target_root'])
     desired = {member['ytid']: (show, member) for show, member in plan_members(plan)}
 
-    # 1. Files of videos that left the plan or changed place
+    # 1. Videos that left the plan or changed place (move mode renames them in step 2; files of
+    #    removed videos are already gone, cleanup_orphans drops what is left around them)
     for ytid, previous in applied.items():
         current = desired.get(ytid)
         if current and current[1]['target'] == previous.get('target'):
             continue
         (result.moved if current else result.removed).append(ytid)
+        if moving:
+            continue
         old_video = os.path.join(target_root, previous['target'])
         remove_managed_file(old_video, target_root, result, dry_run, f"{'moved' if current else 'removed'} {ytid}")
         remove_managed_file(thumb_path_for(old_video), target_root, result, dry_run, f"thumb of {ytid}")
 
-    # 2. Links and episode thumbs
+    # 2. Videos and episode thumbs
     for ytid, (show, member) in desired.items():
         if ytid not in applied:
             result.new.append(ytid)
@@ -1226,22 +1427,39 @@ def apply_plan(plan: dict, config: dict, applied: Dict[str, dict], fetch_image,
             result.add('error', target, f"source missing: {source}")
             result.applied.pop(ytid)
             continue
-        if os.path.lexists(target):
-            if not link_is_current(source, target, mode):
-                result.add('error', target, f"exists and is not a {mode} of {source}")
+        if moving and os.path.exists(target) and same_file(source, target):
+            pass
+        elif os.path.lexists(target):
+            if moving or not link_is_current(source, target, mode):
+                result.add('error', target, f"exists and is not {'the video' if moving else f'a {mode} of'} {source}")
         else:
-            result.add('link', target, source)
-            if not dry_run:
-                try:
+            result.add('move' if moving else 'link', target, source)
+            result.planned.add(target)
+            try:
+                if moving:
+                    sidecars_first = video_sidecars(source)
+                    if not dry_run:
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        os.rename(source, target)
+                    for sidecar in sidecars_first:
+                        destination = sidecar_destination(sidecar, source, target)
+                        if os.path.exists(destination) or destination in result.planned:
+                            result.add('error', sidecar, f"not moved, {destination} already exists")
+                            continue
+                        result.add('move', destination, sidecar)
+                        result.planned.add(destination)
+                        if not dry_run:
+                            move_file(sidecar, destination)
+                elif not dry_run:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
                     link_file(source, target, mode)
-                except OSError as e:
-                    result.add('error', target, f"link failed: {e}")
-                    result.applied.pop(ytid)
-                    continue
+            except OSError as e:
+                result.add('error', target, f"{mode} failed: {e}")
+                result.applied.pop(ytid)
+                continue
 
         thumb = thumb_path_for(target)
-        if not os.path.exists(thumb):
+        if not os.path.exists(thumb) and thumb not in result.planned:
             result.add('thumb', thumb, ytid)
             if not dry_run:
                 try:
@@ -1252,6 +1470,10 @@ def apply_plan(plan: dict, config: dict, applied: Dict[str, dict], fetch_image,
                         result.add('error', thumb, f"no thumbnail found for {ytid}")
                 except (OSError, ValueError) as e:
                     result.add('error', thumb, f"thumbnail failed: {e}")
+
+    # 2b. Inbox copies that are the same file as a library video (hardlink twins): adopt them
+    if moving and config.get('inbox_dir'):
+        adopt_inbox_twins(os.path.expanduser(config['inbox_dir']), target_root, desired, result, dry_run)
 
     # 3. Series poster (2:3) and background, from the first part's thumb
     for show in plan['series']:
@@ -1282,13 +1504,34 @@ def apply_plan(plan: dict, config: dict, applied: Dict[str, dict], fetch_image,
     return result
 
 
+def adopt_inbox_twins(inbox_dir: str, target_root: str, desired: Dict[str, Tuple[dict, dict]],
+                      result: ApplyResult, dry_run: bool) -> None:
+    """Delete inbox videos that are hardlinks of their library file (same inode), keeping their sidecars."""
+    for video in list_videos(inbox_dir, False):
+        ytid = extract_ytid_from_path(video)
+        if ytid not in desired:
+            continue
+        target = os.path.join(target_root, desired[ytid][1]['target'])
+        if not (os.path.exists(target) and same_file(video, target)):
+            continue
+        move_sidecars(video, target, result, dry_run, drop_existing=True)
+        result.add('adopt', video, target)
+        if not dry_run:
+            os.remove(video)
+
+
+def is_managed_sidecar(path: str) -> bool:
+    return path.lower().endswith(MANAGED_SIDECAR_SUFFIXES)
+
+
 def cleanup_orphans(target_root: str, result: ApplyResult, dry_run: bool) -> None:
-    """Remove orphan episode thumbs, series assets and empty folders inside target_root."""
+    """Remove orphan sidecars (thumbs, subtitles, info.json), series assets and empty folders in target_root."""
     removed_paths = {a.path for a in result.actions if a.kind == 'remove'}
-    linked_paths = {a.path for a in result.actions if a.kind == 'link'}
+    moved_away = {a.detail for a in result.actions if a.kind == 'move'}
+    created = {a.path for a in result.actions if a.kind in ('link', 'move')}
 
     def alive(path: str) -> bool:
-        return (os.path.exists(path) and path not in removed_paths) or path in linked_paths
+        return (os.path.exists(path) and path not in removed_paths and path not in moved_away) or path in created
 
     for dirpath, dirnames, filenames in os.walk(target_root, topdown=False):
         if dirpath == target_root:
@@ -1296,11 +1539,13 @@ def cleanup_orphans(target_root: str, result: ApplyResult, dry_run: bool) -> Non
         junk = [os.path.join(dirpath, f) for f in filenames if is_os_junk(f)]
         files = [os.path.join(dirpath, f) for f in filenames if not is_os_junk(f)]
         videos = [f for f in files if os.path.splitext(f)[1].lower() in VIDEO_EXTENSIONS and alive(f)]
+        video_bases = [os.path.splitext(v)[0] for v in videos]
         for path in files:
-            if path.endswith('.jpg') and path not in removed_paths and os.path.basename(path) not in SERIES_ASSETS:
-                siblings = [v for v in videos if os.path.splitext(v)[0] == os.path.splitext(path)[0]]
-                if not siblings:
-                    remove_managed_file(path, target_root, result, dry_run, 'orphan thumb')
+            if (path in removed_paths or path in moved_away or os.path.basename(path) in SERIES_ASSETS
+                    or os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS or not is_managed_sidecar(path)):
+                continue
+            if not any(path.startswith(base + '.') for base in video_bases):
+                remove_managed_file(path, target_root, result, dry_run, 'orphan sidecar')
 
         subdirs_alive = any(os.path.isdir(os.path.join(dirpath, d)) and
                             os.path.join(dirpath, d) not in {a.path for a in result.actions if a.kind == 'rmdir'}
@@ -1311,7 +1556,8 @@ def cleanup_orphans(target_root: str, result: ApplyResult, dry_run: bool) -> Non
             asset_path = os.path.join(dirpath, asset)
             if asset_path in files and asset_path not in removed_paths:
                 remove_managed_file(asset_path, target_root, result, dry_run, 'orphan series asset')
-        leftovers = [f for f in files if f not in {a.path for a in result.actions if a.kind == 'remove'}]
+        gone = {a.path for a in result.actions if a.kind == 'remove'} | moved_away
+        leftovers = [f for f in files if f not in gone]
         if leftovers:
             result.add('error', dirpath, f"not removed, unknown files: {[os.path.basename(f) for f in leftovers]}")
             continue
@@ -1325,7 +1571,8 @@ def cleanup_orphans(target_root: str, result: ApplyResult, dry_run: bool) -> Non
 def print_apply_report(result: ApplyResult, dry_run: bool, report_path: Optional[str]) -> None:
     title = "🧪 DRY RUN: nothing was changed" if dry_run else "✅ Apply finished"
     print(f"\n{title}")
-    labels = [('link', '🔗 Video links'), ('thumb', '🖼️  Episode thumbs'), ('poster', '🎨 Posters'),
+    labels = [('link', '🔗 Video links'), ('move', '🚚 Moved files'), ('adopt', '🤝 Inbox twins adopted'),
+              ('thumb', '🖼️  Episode thumbs'), ('poster', '🎨 Posters'),
               ('background', '🌄 Backgrounds'), ('remove', '🗑️  Removed files'), ('rmdir', '📁 Removed folders'),
               ('error', '❌ Errors')]
     for kind, label in labels:
@@ -1714,6 +1961,8 @@ def ensure_channel_collections(section, channels: Set[str], dry_run: bool = True
 # --------------------------------------------------------------------------- #
 
 def cmd_catalog(args, config: dict) -> int:
+    if config.get('inbox_dir'):
+        return catalog_from_disk(config)
     plex = connect_to_plex(config)
     section = plex.library.section(config['source_library'])
     print(f"\n📚 Reading library: {section.title} ({section.type}, {section.totalSize} items)")
@@ -1732,13 +1981,51 @@ def cmd_catalog(args, config: dict) -> int:
     return 0
 
 
+def catalog_from_disk(config: dict) -> int:
+    """Catalog the library tree and the inbox; metadata from the YouTube cache/API like youtube_hydrator.py."""
+    state_dir = config['state_dir']
+    inbox_dir = os.path.expanduser(config['inbox_dir'])
+    target_root = os.path.expanduser(config['target_root'])
+    if not os.path.isdir(inbox_dir):
+        print(f"❌ Error: inbox_dir {inbox_dir} does not exist")
+        return 1
+    cache_path = os.path.expanduser(config.get('metadata_cache') or os.path.join(state_dir, 'youtube_metadata_cache.json'))
+    cache = load_json(cache_path, {})
+    cached_before = len(cache)
+    fetch = make_youtube_metadata_fetcher(config.get('youtube_api_key'), cache)
+
+    archive_name = config.get('download_archive')   # file name inside inbox_dir
+    archive_ids = load_download_archive(os.path.join(inbox_dir, archive_name) if archive_name else None)
+
+    print(f"\n📚 Reading videos: library {target_root}, inbox {inbox_dir}")
+    entries, skipped = build_disk_catalog(inbox_dir, target_root, fetch, archive_ids)
+    if len(cache) != cached_before:
+        save_json(cache_path, cache)
+    path = os.path.join(state_dir, 'catalog.json')
+    save_json(path, entries)
+
+    sources = defaultdict(int)
+    for entry in entries:
+        sources[entry['channel_source']] += 1
+    print(f"   🎞️  Library videos:         {sum(1 for e in entries if e['location'] == 'library')}")
+    print(f"   📥 Inbox videos:           {sum(1 for e in entries if e['location'] == 'inbox')}")
+    if archive_ids is not None:
+        print(f"   ⏳ Inbox not in archive:   {len(skipped)} (still downloading or failed, skipped)")
+    print(f"   📡 Channels:               {len({e['channel'] for e in entries})}")
+    print(f"   🌐 Metadata: YouTube {sources['youtube']} ({len(cache) - cached_before} API calls), "
+          f".info.json {sources['info.json']}, filename only {sources['filename']}")
+    if not config.get('youtube_api_key'):
+        print("   ⚠️  No YOUTUBE_API_KEY: only cached metadata and .info.json are used")
+    print(f"\n💾 Saved {path}")
+    return 0
+
+
 def cmd_export_watch(args, config: dict) -> int:
     plex = connect_to_plex(config)
     library = config['target_library'] if args.library == 'target' else config['source_library']
     watch = export_watch(plex, library, config.get('users'))
     path = args.output or os.path.join(config['state_dir'], 'watch.json')
     save_json(path, watch)
-    from datetime import datetime
     backup = os.path.join(config['state_dir'], 'backups',
                           f"watch-{args.library}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json")
     save_json(backup, watch)
@@ -1898,7 +2185,8 @@ def cmd_sync(args, config: dict) -> int:
     # Watch state is read before files move: moved videos from the new library, new ones from the old
     plex = connect_to_plex(config)
     users = config.get('users')
-    old_watch = export_watch(plex, config['source_library'], users)
+    old_library = config.get('source_library')   # only in the hardlink setup with a separate "inbox" library
+    old_watch = export_watch(plex, old_library, users) if old_library else {}
     new_watch = export_watch(plex, config['target_library'], users) if applied else {}
 
     status = 0
@@ -1906,7 +2194,6 @@ def cmd_sync(args, config: dict) -> int:
         watch = merge_watch(filter_watch(old_watch, set(new)), filter_watch(new_watch, set(moved)))
         watch_path = os.path.join(state_dir, 'watch_sync.json')
         save_json(watch_path, watch)
-        from datetime import datetime
         save_json(os.path.join(state_dir, 'backups', f"watch-sync-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"),
                   watch)
 
@@ -1921,6 +2208,9 @@ def cmd_sync(args, config: dict) -> int:
     else:
         print("✅ No file changes")
 
+    if not old_library:
+        return status
+
     # Videos already migrated and still in place: carry over progress made in the old library
     migrated = set(applied) - set(moved) - set(removed)
     changes = forward_watch_changes(old_watch, new_watch, migrated)
@@ -1931,6 +2221,9 @@ def cmd_sync(args, config: dict) -> int:
 
 def cmd_sync_watch(args, config: dict) -> int:
     """Only the forward watch-state step of sync."""
+    if not config.get('source_library'):
+        print("❌ Error: sync-watch needs source_library (the old library to read watch state from)")
+        return 1
     applied = load_applied(config)
     if not applied:
         print("❌ Error: nothing applied yet (run 'apply' first)")

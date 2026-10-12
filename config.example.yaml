@@ -1,14 +1,19 @@
 plex:                                   # empty -> PLEX_URL / PLEX_TOKEN from .env
   url:
   token:
-source_library:                         # empty -> LIBRARY_NAME from .env
-target_library: "Manhwa Series"         # new library (type TV Shows)
-target_root: ~/mnt/plex-media/Manhwa-Series   # LOCAL path where the script builds the tree
-path_map:                               # Plex prefix -> local prefix
-  "/data": "~/mnt/plex-media"
-info_json_dir:                        # empty -> .info.json next to each video (via path_map)
-link_mode: hardlink                     # hardlink | symlink | copy
+target_library: "Manhwa"                # Plex TV library holding the organized tree
+inbox_dir: /data/Manhwa-temp            # yt-dlp downloads here (not a Plex library)
+download_archive: ytdlp_archive.txt     # yt-dlp --download-archive file inside inbox_dir; unlisted videos are skipped
+target_root: /data/Manhwa               # LOCAL path of the organized tree
+path_map: {}                            # Plex prefix -> local prefix, e.g. "/data": "~/mnt/plex-media"
+link_mode: move                         # move | hardlink | symlink | copy
+youtube_api_key:                        # empty -> YOUTUBE_API_KEY from .env (metadata like youtube_hydrator.py)
+metadata_cache:                         # empty -> <state_dir>/youtube_metadata_cache.json
 users: []                               # all | [] (owner only) | [name1, name2]
 strip_title_patterns: []
 state_dir: ./state
 scan_timeout_minutes: 30
+
+# Hardlink setup only (a separate Plex library of the originals, used as catalog source):
+# source_library: "Manhwa"              # empty -> LIBRARY_NAME from .env; ignored when inbox_dir is set
+# info_json_dir:                        # where to find .info.json files for the channel name
