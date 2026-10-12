@@ -28,9 +28,9 @@ The scripts read configuration from `.env` via `python-dotenv`: `PLEX_URL`, `PLE
 
 ## manhwa_organizer.py
 
-Reorganizes the "Manhwa" library (Plex type Other Videos, one flat folder, files named `%(channel)s - %(title)s [%(id)s].ext` by yt-dlp) into the "Manhwa Series" TV library: one show per story, one episode per part. The tests (`tests/`) are the reference for the intended behavior.
+Organizes YouTube manhwa recaps into the "Manhwa" Plex TV library: one show per story, one episode per part. yt-dlp downloads into an inbox folder outside Plex (`/data/Manhwa-temp`, files named `%(channel)s - %(title)s [%(id)s].ext`). `sync` moves each finished download into `/data/Manhwa/<Show>/Season NN/<Show> - SxxEyy [id].ext`, taking its `.info.json`, subtitles and thumbnail along. The tests (`tests/`) are the reference for the intended behavior.
 
-Pipeline (CLI subcommands): `catalog` → `plan` → `apply` → `refresh`, with `export-watch`, `collections`, `sync-watch`, and `sync` for incremental runs. `sync` runs catalog, plan, watch export, apply, then refresh for new and moved videos only. It then carries watch progress made in the old library into already-migrated videos (`forward_watch_changes`). That step is forward only: it never unmarks a played video or rewinds progress. Plex's API cannot set watched dates, so restored views get the current date. Every command that writes has `--dry-run`, and `apply_plan`/`refresh_library` default to dry run.
+Pipeline (CLI subcommands): `catalog` → `plan` → `apply` → `refresh`, with `export-watch`, `collections`, and `sync`. `sync` runs catalog, plan, a watch export of renumbered episodes, apply, then refresh of new and moved videos only. Every command that writes has `--dry-run`, and `apply_plan`/`refresh_library` default to dry run.
 
 ```bash
 .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
@@ -41,14 +41,17 @@ Pipeline (CLI subcommands): `catalog` → `plan` → `apply` → `refresh`, with
 ```
 
 How it decides things:
+- **Catalog** (`catalog_from_disk`): every video in the library tree plus the inbox top level. Inbox videos only count when their ID is in the yt-dlp `--download-archive` file (`download_archive`, a file name inside `inbox_dir`), so unfinished downloads are skipped. Metadata comes from the YouTube Data API through `youtube_hydrator.get_youtube_metadata` and a JSON cache (`metadata_cache`, same format as `youtube_metadata_cache.json`). The `.info.json` is the fallback. When an ID exists twice, the library copy wins.
 - **Grouping** (`group_videos`): union-find over videos linked by labelled YouTube links in descriptions (`Part N <url>`; unlabelled links are ignored on purpose), plus same channel + same normalized title (`title_key`). Overrides in `overrides.yaml` (`show_names`, `parts`, `merge`, `detach`) are applied on top.
 - **Part number** (`collect_votes`/`decide_part`): weighted votes. Explicit self-claim and timestamp chapters weigh 3, citations by other videos 2, title formats (`Part N`, `(N)`, `[N]`, `[N-M]`, `#N+M`, `Manhwa Recap N`) 1.5, gap inference 1. Description evidence deliberately outranks titles.
 - **Episodes** (`assign_episodes`): a compilation covering parts that no individual video has takes those parts. If none exist, it becomes a multi-episode file (`S01E01-E05`); if all exist, it goes to Season 00. Timestamp chapters only count when other videos of the series are numbered (many standalone videos have internal "Parte 1/2" sections). An old unnumbered video before all numbered ones becomes part 1.
-- **Stability**: `state/applied.json` pins show names and current paths. Without it, `load_applied` rebuilds it from the target tree, so a fresh state volume does not reapply everything.
+- **Stability**: `state/applied.json` pins show names and current paths. Without it, `load_applied` rebuilds it from the library tree, so a fresh state volume does not reapply everything.
 
-Files and safety: `apply` only creates hardlinks (`link_mode`) and jpgs under `target_root`, and only deletes inside it. Originals are never touched. Hardlinks need the same filesystem. macOS writes `._*` AppleDouble files on the NFS share, and `is_os_junk` ignores them. `refresh` locks episode title ("Parte N"), summary and date, plus show title and Studio (= channel). The `collections` command creates one smart collection per channel, filtering on Studio.
+Files and safety (`link_mode: move`): `apply` renames on the same filesystem. It only moves known companions (`MANAGED_SIDECAR_SUFFIXES`); yt-dlp leftovers such as `.part`, `.f140.m4a` or `.temp.mp4` stay in the inbox. An inbox file that is a hardlink of its library copy (same inode) is adopted, meaning deleted, and a different file with the same ID is never touched. Deleting a video in Plex is final, and `cleanup_orphans` (inside the library) drops its leftover sidecars and empty folders. The older `hardlink` mode, with a separate Plex library as `source_library`, is still supported. macOS writes `._*` AppleDouble files on the NFS share, and `is_os_junk` ignores them.
 
-Config is in `config.yaml` (gitignored; `config.example.yaml` documents it). Plex URL, token and source library fall back to `.env`. Runtime state lives in `state/` (gitignored), and watch-state backups go to `state/backups/`. In production `sync` runs as a Kubernetes CronJob from the Docker image, as uid 1000 with the NFS share mounted at `/data` (the same path Plex sees, so `path_map` is empty) and `state_dir` on a PVC. The manifest lives outside this repo.
+`refresh` locks episode title ("Parte N"; specials "Partes 1-16"), summary and date, plus show title and Studio (= channel), and restores watch state. The `collections` command creates one smart collection per channel, filtering on Studio. Plex's API cannot set watched dates, so restored views get the current date.
+
+Config is in `config.yaml` (gitignored; `config.example.yaml` documents it). Plex URL and token fall back to `.env` (`PLEX_URL`, `PLEX_TOKEN`), and so does `YOUTUBE_API_KEY`. Runtime state lives in `state/` (gitignored), and watch-state backups go to `state/backups/`. In production `sync` runs as a Kubernetes CronJob from the Docker image, as uid 1000 with the NFS share mounted at `/data` (the same path Plex sees, so `path_map` is empty) and `state_dir` on a PVC. The manifest lives outside this repo. `youtube_hydrator.py` must not target the "Manhwa" library: it would overwrite the "Parte N" titles.
 
 ## Shared state
 
