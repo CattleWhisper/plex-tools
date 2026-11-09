@@ -5,4 +5,4 @@ tqdm==4.70.1
 google-api-python-client==2.201.0
 yt-dlp>=2026.8.19
 PyYAML==6.0.3
-pillow==12.3.0
+pillow==13.0.0
